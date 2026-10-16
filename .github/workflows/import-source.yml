@@ -1,0 +1,46 @@
+name: Import v0.1.5 source files
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'source_package.base64'
+      - '.github/workflows/import-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Restore project sources
+        shell: bash
+        run: |
+          if [ ! -s source_package.base64 ]; then
+            echo 'Waiting for source package.'
+            exit 0
+          fi
+          python3 - <<'PY'
+          import base64,io,zipfile,pathlib
+          payload=base64.b64decode(pathlib.Path('source_package.base64').read_text().strip())
+          with zipfile.ZipFile(io.BytesIO(payload)) as z:
+              for member in z.infolist():
+                  output=pathlib.Path(member.filename)
+                  if member.is_dir() or output.is_absolute() or '..' in output.parts:
+                      raise RuntimeError('Unsafe path: '+member.filename)
+                  output.parent.mkdir(parents=True, exist_ok=True)
+                  output.write_bytes(z.read(member))
+          PY
+          rm -f source_package.base64
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: import full IQ-TREE 2 GUI v0.1.5 sources"
+            git push
+          fi
