@@ -1,0 +1,21 @@
+name: Build Windows GUI
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+      - name: Build standalone app
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name IQTree2_GUI --add-data "assets;assets" --add-data "examples;examples" app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IQTree2_GUI_Windows
+          path: dist/IQTree2_GUI.exe
