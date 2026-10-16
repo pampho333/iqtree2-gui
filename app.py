@@ -20,7 +20,7 @@ from alignment_taxa import read_alignment_taxa, join_outgroups
 from ui_controls import TickCheckbutton
 from theme_colors import DEFAULT_THEME, normalize_hex, resolve_theme
 
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.7"
 BASE = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
 RESOURCES = Path(getattr(sys, '_MEIPASS', BASE))
 PREFS = Path.home() / '.iqtree2_gui_settings.json'
@@ -44,6 +44,73 @@ STATUS_DOT_ERROR = '#E67C7C'
 FONT = ('Segoe UI', 11)
 
 
+def enable_high_dpi():
+    """Ask Windows for real monitor pixels *before* creating the Tk root.
+
+    Per-monitor DPI awareness allows the window to follow a laptop when it is
+    moved between 100%, 125%, and 150% displays. Some packaged executables
+    set this awareness in their manifest; a failure here is harmless.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        try:
+            # PER_MONITOR_AWARE_V2 = -4
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+        except (AttributeError, OSError):
+            pass
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            try:
+                user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
+    except (ImportError, OSError):
+        pass
+
+
+def monitor_work_area():
+    """Return the work rectangle of the monitor under the mouse, if available.
+
+    Unlike winfo_screenheight, Windows' rcWork excludes the taskbar.
+    If the platform does not provide it, fall back to Tk screen dimensions.
+    """
+    if sys.platform != 'win32':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', wintypes.RECT),
+                        ('rcWork', wintypes.RECT), ('dwFlags', wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        point = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        user32.MonitorFromPoint.argtypes = (wintypes.POINT, wintypes.DWORD)
+        user32.MonitorFromPoint.restype = wintypes.HANDLE
+        monitor = user32.MonitorFromPoint(point, 2)  # nearest monitor
+        if not monitor:
+            return None
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW.argtypes = (wintypes.HANDLE, ctypes.POINTER(MONITORINFO))
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        rect = info.rcWork
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (rect.left, rect.top, rect.right, rect.bottom)
+    except (AttributeError, OSError, ImportError, TypeError, ValueError):
+        return None
+
+
 def open_local(path: str):
     if sys.platform == 'win32':
         os.startfile(path)
@@ -58,17 +125,42 @@ class ScrollableFrame(ttk.Frame):
         super().__init__(parent)
         self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
         self.vscroll = ttk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vscroll.set)
+        self.hscroll = ttk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vscroll.set, xscrollcommand=self.hscroll.set)
         self.vscroll.pack(side='right', fill='y')
         self.canvas.pack(side='left', fill='both', expand=True)
-        self.inner = ttk.Frame(self.canvas, padding=(16, 10, 18, 26))
+        self.inner = ttk.Frame(self.canvas, padding=(14, 8, 16, 20))
         self.window = self.canvas.create_window((0, 0), window=self.inner, anchor='nw')
-        self.inner.bind('<Configure>', lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.bind('<Configure>', lambda e: self.canvas.itemconfigure(self.window, width=e.width))
-        # Mouse wheel should work even while hovering over an Entry or Checkbutton.
+        self.inner.bind('<Configure>', lambda e: self._sync_scroll_area())
+        self.canvas.bind('<Configure>', lambda e: self._sync_scroll_area(e.width))
+        # Wheel/Shift+wheel allow access to all settings even on very small screens.
         self.bind_all('<MouseWheel>', self._scroll, add=True)
+        self.bind_all('<Shift-MouseWheel>', self._scroll_horizontal, add=True)
         self.bind_all('<Button-4>', self._scroll, add=True)
         self.bind_all('<Button-5>', self._scroll, add=True)
+
+    def _sync_scroll_area(self, viewport_width=None):
+        if viewport_width is None:
+            viewport_width = self.canvas.winfo_width()
+        intrinsic = self.inner.winfo_reqwidth()
+        need_horizontal = intrinsic > viewport_width + 1
+        # Native field controls have a minimum readable width. On narrower
+        # screens the last resort is horizontal scrolling, never silent crop.
+        if need_horizontal:
+            if not self.hscroll.winfo_manager():
+                self.hscroll.pack(side='bottom', fill='x', before=self.canvas)
+        elif self.hscroll.winfo_manager():
+            self.hscroll.pack_forget()
+            self.canvas.xview_moveto(0)
+        self.canvas.itemconfigure(self.window, width=max(viewport_width, intrinsic))
+        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+
+    def _scroll_horizontal(self, e):
+        if not self.canvas.winfo_ismapped():
+            return
+        if e.delta:
+            self.canvas.xview_scroll(-3 if e.delta > 0 else 3, 'units')
+        return 'break'
 
     def _scroll(self, e):
         if not self.canvas.winfo_ismapped(): return
@@ -87,9 +179,11 @@ class IQTreeGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f'IQ-TREE 2 GUI  •  v{APP_VERSION}')
-        self.geometry('1260x890')
-        self.minsize(1050, 720)
+        self.compact_layout = False
+        self._last_layout = None
+        self._resize_job = None
         self.configure(background=BG)
+        self._apply_initial_geometry()
         self.theme_choice = self._read_theme_preferences()
         self._activate_palette(self.theme_choice)
         self._set_icon()
@@ -117,8 +211,90 @@ class IQTreeGUI(tk.Tk):
         self.on_model_change()
         self.on_boot_change()
         self.refresh_preview()
+        self.bind('<Configure>', self._on_window_configure, add=True)
+        self.after_idle(self._apply_responsive_layout)
+        # Windows itself knows how to fit a maximized window into the work
+        # area even with non-standard taskbar positions / scaling.
+        if sys.platform == 'win32' and self._available_work_height < 900:
+            self.after_idle(self._maximize_for_laptop)
         self.after(100, self.poll_events)
         self.protocol('WM_DELETE_WINDOW', self.exit_app)
+
+    def _apply_initial_geometry(self):
+        from responsive_layout import recommended_geometry
+        self.update_idletasks()
+        rect = monitor_work_area() or (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
+        self._available_work_height = rect[3] - rect[1]
+        x, y, width, height = recommended_geometry(rect)
+        self.compact_layout = height < 790 or width < 1160
+        self.geometry(f'{width}x{height}+{x}+{y}')
+        # Never require more pixels than the physical screen can provide.
+        self.minsize(min(700, width), min(450, height))
+
+    def _maximize_for_laptop(self):
+        if not self.winfo_exists():
+            return
+        try:
+            self.state('zoomed')
+        except tk.TclError:
+            # Only Windows has the zoomed state; non-Windows use geometry.
+            pass
+
+    def _on_window_configure(self, event):
+        if event.widget is not self:
+            return
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        # Reflow when resized or moved to another display, not on each pixel.
+        self._resize_job = self.after(70, self._apply_responsive_layout)
+
+    def _apply_responsive_layout(self):
+        self._resize_job = None
+        if not hasattr(self, 'footer_left'):
+            return
+        from responsive_layout import choose_layout
+        width = self.winfo_width()
+        mode = choose_layout(width)
+        if mode == self._last_layout:
+            return
+        self._last_layout = mode
+        narrow = mode != 'wide'
+        if narrow:
+            self.header_subtitle.pack_forget()
+        else:
+            self.header_subtitle.pack(side='left', padx=(18, 0))
+        # Reflow footer rather than silently clipping buttons. Keep controls
+        # independently visible when users resize the window.
+        self.footer_left.grid_forget()
+        self.footer_right.grid_forget()
+        for col in (0, 1):
+            self.footer.columnconfigure(col, weight=0)
+        if mode == 'wide':
+            self.footer.columnconfigure(0, weight=1)
+            self.footer_left.grid(row=0, column=0, sticky='w')
+            self.footer_right.grid(row=0, column=1, sticky='e')
+        elif mode == 'medium':
+            self.footer.columnconfigure(0, weight=1)
+            self.footer_left.grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 5))
+            self.footer_right.grid(row=1, column=0, columnspan=2, sticky='e')
+        else:
+            self.footer.columnconfigure(0, weight=1)
+            self.footer_left.grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 4))
+            self.footer_right.grid(row=1, column=0, columnspan=2, sticky='e')
+        # Shorter captions are used only for narrow widths; full functionality
+        # is not hidden or removed.
+        short = mode in ('narrow', 'extra_narrow')
+        labels = ('예제', '불러오기', '저장', '색상', '홈페이지') if short else (
+            '예제 불러오기', '설정 불러오기', '설정 저장', '색상 설정', '공식 홈페이지')
+        for btn in self.footer_aux_buttons:
+            btn.grid_forget()
+        for i, (btn, label) in enumerate(zip(self.footer_aux_buttons, labels)):
+            btn.configure(text=label)
+            if mode == 'extra_narrow':
+                row, col = divmod(i, 3)
+            else:
+                row, col = 0, i
+            btn.grid(row=row, column=col, sticky='ew', padx=(0, 6), pady=(0, 4))
 
     def _set_icon(self):
         icon_file = RESOURCES / 'assets' / 'icon.png'
@@ -416,21 +592,26 @@ class IQTreeGUI(tk.Tk):
         self.version_label = tk.StringVar(value='IQ-TREE 2 실행 파일을 선택하십시오.')
 
     def build_ui(self):
-        header = tk.Frame(self, bg=BG, height=94)
-        header.pack(fill='x', padx=26, pady=(18, 0))
-        titlebox = tk.Frame(header, bg=BG)
-        titlebox.pack(side='left')
-        tk.Label(titlebox, text='IQ-TREE', font=('Segoe UI Semibold', 26), fg=FG, bg=BG).pack(side='left')
-        tk.Label(titlebox, text=' 2 ', font=('Segoe UI Semibold', 26), fg=ACCENT, bg=BG).pack(side='left')
-        tk.Label(titlebox, text='GUI', font=('Segoe UI', 22), fg=MUTED, bg=BG).pack(side='left')
-        ttk.Label(header, text='ML PHYLOGENY WORKSPACE  ·  Windows / WSL', style='Muted.TLabel').pack(side='left', padx=(26, 0))
-        sbox = tk.Frame(header, bg=SURFACE, padx=14, pady=8)
-        sbox.pack(side='right', pady=9)
+        header = tk.Frame(self, bg=BG)
+        self.header = header
+        header.pack(side='top', fill='x', padx=18, pady=(8, 4))
+        # Right status first so it never gets clipped by the title/subtitle.
+        sbox = tk.Frame(header, bg=SURFACE, padx=8, pady=4)
+        sbox.pack(side='right', padx=(10, 0))
         self.status_dot_label = tk.Label(sbox, text='●', font=('Segoe UI', 14), fg=STATUS_DOT_IDLE, bg=SURFACE)
         self.status_dot_label.pack(side='left', padx=(0, 8))
         tk.Label(sbox, textvariable=self.status, font=('Segoe UI Semibold', 11), fg=FG, bg=SURFACE).pack(side='left')
+        titlebox = tk.Frame(header, bg=BG)
+        titlebox.pack(side='left')
+        tk.Label(titlebox, text='IQ-TREE', font=('Segoe UI Semibold', 24), fg=FG, bg=BG).pack(side='left')
+        tk.Label(titlebox, text=' 2 ', font=('Segoe UI Semibold', 24), fg=ACCENT, bg=BG).pack(side='left')
+        tk.Label(titlebox, text='GUI', font=('Segoe UI', 20), fg=MUTED, bg=BG).pack(side='left')
+        self.header_subtitle = ttk.Label(header, text='ML PHYLOGENY WORKSPACE  ·  Windows / WSL', style='Muted.TLabel')
+        # The footer MUST be created and packed before the notebook. The
+        # notebook gets remaining height and is the only shrinking element.
+        self.build_footer()
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill='both', expand=True, padx=26, pady=(0, 10))
+        self.notebook.pack(side='top', fill='both', expand=True, padx=18, pady=(0, 5))
         self.settings_scroll = ScrollableFrame(self.notebook)
         self.notebook.add(self.settings_scroll, text='  분석 설정  ')
         self.log_frame = ttk.Frame(self.notebook, padding=16)
@@ -440,7 +621,6 @@ class IQTreeGUI(tk.Tk):
         self.build_setup(self.settings_scroll.inner)
         self.build_log_tab()
         self.build_results_tab()
-        self.build_footer()
 
     def section(self, parent, title):
         box = ttk.Labelframe(parent, text='  ' + title + '  ', padding=(18, 14, 18, 15))
@@ -592,16 +772,24 @@ class IQTreeGUI(tk.Tk):
         self.result_summary.pack(anchor='w', pady=(18, 0))
 
     def build_footer(self):
-        footer = ttk.Frame(self, padding=(26, 8, 26, 16))
-        footer.pack(fill='x')
-        ttk.Button(footer, text='예제 불러오기', command=self.load_example).pack(side='left', padx=(0, 9))
-        ttk.Button(footer, text='설정 불러오기', command=self.import_config).pack(side='left', padx=(0, 9))
-        ttk.Button(footer, text='설정 저장', command=self.export_config).pack(side='left', padx=(0, 9))
-        ttk.Button(footer, text='색상 설정', command=self.open_theme_dialog).pack(side='left', padx=(0, 9))
-        ttk.Button(footer, text='공식 홈페이지', command=lambda: webbrowser.open(DOCS)).pack(side='left')
-        self.stop_btn = ttk.Button(footer, text='■ 중지', style='Danger.TButton', command=self.stop_run, state='disabled')
-        self.stop_btn.pack(side='right', padx=(12, 0))
-        self.start_btn = ttk.Button(footer, text='▶ 분석 실행', style='Accent.TButton', command=self.start_run)
+        self.footer = ttk.Frame(self, padding=(18, 6, 18, 8))
+        self.footer.pack(side='bottom', fill='x')
+        self.footer_left = ttk.Frame(self.footer)
+        self.footer_right = ttk.Frame(self.footer)
+        aux = [
+            ('예제 불러오기', self.load_example),
+            ('설정 불러오기', self.import_config),
+            ('설정 저장', self.export_config),
+            ('색상 설정', self.open_theme_dialog),
+            ('공식 홈페이지', lambda: webbrowser.open(DOCS)),
+        ]
+        self.footer_aux_buttons = []
+        for name, command in aux:
+            btn = ttk.Button(self.footer_left, text=name, command=command)
+            self.footer_aux_buttons.append(btn)
+        self.stop_btn = ttk.Button(self.footer_right, text='■ 중지', style='Danger.TButton', command=self.stop_run, state='disabled')
+        self.stop_btn.pack(side='right', padx=(7, 0))
+        self.start_btn = ttk.Button(self.footer_right, text='▶ 분석 실행', style='Accent.TButton', command=self.start_run)
         self.start_btn.pack(side='right')
 
     def load_example(self):
@@ -1108,5 +1296,6 @@ class IQTreeGUI(tk.Tk):
 
 
 if __name__ == '__main__':
+    enable_high_dpi()
     app = IQTreeGUI()
     app.mainloop()
