@@ -1,0 +1,90 @@
+name: Publish v0.1.5 Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-v0.1.5.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-iqtree-gui-v0.1.5
+  cancel-in-progress: false
+
+jobs:
+  windows-build:
+    name: Test and build Windows executable
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+      - name: Build standalone Windows GUI
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name IQTree2_GUI --add-data "assets;assets" --add-data "examples;examples" app.py
+          if (!(Test-Path "dist/IQTree2_GUI.exe")) { throw "Expected EXE not found" }
+      - name: Upload built EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: IQTree2-GUI-Windows-v0.1.5
+          path: dist/IQTree2_GUI.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Create release and attach downloads
+    runs-on: ubuntu-latest
+    needs: windows-build
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Download Windows EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: IQTree2-GUI-Windows-v0.1.5
+          path: release/windows
+      - name: Package Windows EXE and full source
+        shell: bash
+        run: |
+          test -s release/windows/IQTree2_GUI.exe
+          git archive --format=zip --output=IQTree2_GUI_v0.1.5_Source.zip HEAD
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          with zipfile.ZipFile('IQTree2_GUI_Windows_v0.1.5.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+              archive.write('release/windows/IQTree2_GUI.exe', 'IQTree2_GUI.exe')
+              archive.write('README.md', 'README.md')
+              archive.write('LICENSE', 'LICENSE')
+          for name in ('IQTree2_GUI_Windows_v0.1.5.zip','IQTree2_GUI_v0.1.5_Source.zip'):
+              p = Path(name)
+              if not p.is_file() or p.stat().st_size == 0:
+                  raise RuntimeError(f'Empty release asset: {name}')
+              print(name, p.stat().st_size, 'bytes')
+          PY
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v0.1.5 >/dev/null 2>&1; then
+            gh release upload v0.1.5 IQTree2_GUI_Windows_v0.1.5.zip IQTree2_GUI_v0.1.5_Source.zip --clobber
+          else
+            gh release create v0.1.5 \
+              IQTree2_GUI_Windows_v0.1.5.zip \
+              IQTree2_GUI_v0.1.5_Source.zip \
+              --target "$GITHUB_SHA" \
+              --title "IQ-TREE 2 GUI v0.1.5" \
+              --notes-file RELEASE_NOTES_v0.1.5.md \
+              --latest
+          fi
