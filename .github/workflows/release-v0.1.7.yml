@@ -1,0 +1,66 @@
+name: Publish v0.1.7 Laptop Fix
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release-v0.1.7.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Build Windows EXE
+        shell: pwsh
+        run: |
+          python -m pip install pyinstaller
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name IQTree2_GUI --add-data "assets;assets" --add-data "examples;examples" app.py
+          if (!(Test-Path dist/IQTree2_GUI.exe)) { throw "EXE missing" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IQTree2-GUI-Windows-v0.1.7
+          path: dist/IQTree2_GUI.exe
+          if-no-files-found: error
+
+  release:
+    needs: windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: IQTree2-GUI-Windows-v0.1.7
+          path: windows
+      - name: Package EXE and source
+        run: |
+          git archive --format=zip --output=IQTree2_GUI_v0.1.7_Source.zip HEAD
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          assert Path('windows/IQTree2_GUI.exe').is_file()
+          with zipfile.ZipFile('IQTree2_GUI_Windows_v0.1.7.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+              z.write('windows/IQTree2_GUI.exe', 'IQTree2_GUI.exe')
+              z.write('README.md', 'README.md')
+              z.write('LICENSE', 'LICENSE')
+          PY
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create v0.1.7 \
+            IQTree2_GUI_Windows_v0.1.7.zip \
+            IQTree2_GUI_v0.1.7_Source.zip \
+            --target "$GITHUB_SHA" \
+            --title "IQ-TREE 2 GUI v0.1.7 — Responsive Laptop Layout" \
+            --notes "Fixes clipped controls at Windows 125% display scaling. Uses monitor work area, per-monitor DPI awareness, a reserved footer for Run/Stop controls, responsive button wrapping, and scrollable settings. The IQ-TREE 2 engine must be installed separately." \
+            --latest
